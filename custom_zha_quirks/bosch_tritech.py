@@ -28,7 +28,7 @@ from zigpy.zcl.clusters.measurement import (
 from zigpy.zcl.clusters.security import IasZone
 from zigpy.zcl import foundation
 
-from zhaquirks import Bus, LocalDataCluster
+from zhaquirks import Bus, LocalDataCluster, PowerConfigurationCluster
 from zhaquirks.const import (
     DEVICE_TYPE,
     ENDPOINTS,
@@ -42,6 +42,13 @@ from zhaquirks.const import (
 _LOGGER = logging.getLogger(__name__)
 
 MOTION_TIMEOUT_S = 120
+
+
+class BoschPowerConfiguration(PowerConfigurationCluster):
+    """Power configuration with voltage-to-percentage conversion for Bosch sensors."""
+
+    MIN_VOLTS = 1.9  # Minimum voltage (0%)
+    MAX_VOLTS = 3.0  # Maximum voltage (100%)
 
 
 class BoschIasZone(CustomCluster, IasZone):
@@ -150,7 +157,7 @@ class BoschRFDLZBMS(CustomDevice):
                 DEVICE_TYPE: 0x0402,
                 INPUT_CLUSTERS: [
                     Basic.cluster_id,
-                    PowerConfiguration.cluster_id,
+                    BoschPowerConfiguration,
                     Identify.cluster_id,
                     PollControl.cluster_id,
                     IlluminanceMeasurement.cluster_id,
