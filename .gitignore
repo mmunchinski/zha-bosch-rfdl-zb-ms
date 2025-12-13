@@ -2,6 +2,9 @@
 .env
 *.env
 
+# Development notes
+claude.md
+
 # Python
 __pycache__/
 *.py[cod]
