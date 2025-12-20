@@ -1,5 +1,8 @@
 # Bosch RFDL-ZB-MS ZHA Quirk
 
+> **Status:** Pending contribution to [zha-device-handlers](https://github.com/zigpy/zha-device-handlers).
+> Once merged, please use the official version.
+
 A [ZHA device handler (quirk)](https://github.com/zigpy/zha-device-handlers) for the **Bosch RFDL-ZB-MS RADION TriTech** motion sensor.
 
 ## Problem
