@@ -16,6 +16,23 @@ This quirk adds a **virtual Occupancy Sensing cluster (0x0406)** that provides a
 
 This creates a reliable motion clear event regardless of hardware behavior.
 
+### Stuck Motion Detection
+
+The sensor can also get "stuck" in a motion-detected state, failing to send clear events. When this happens, the next physical motion triggers a clear event but not a new detect event. The quirk handles this intelligently:
+
+| Software State | Clear Event Behavior |
+|----------------|---------------------|
+| Not occupied | Treated as motion (stuck sensor finally resetting) |
+| Occupied 30+ seconds | Treated as motion (stuck sensor resetting) |
+| Occupied < 30 seconds | Ignored (normal quick cycle, software timer handles) |
+
+**Why this works:**
+- Normal sensors send motion→clear within ~3-4 seconds
+- If a clear arrives after 30+ seconds, the sensor was likely stuck
+- If a clear arrives when we're not occupied, the sensor was stuck overnight and is now resetting due to new activity
+
+This ensures that walking past a "stuck" sensor will trigger your automations correctly, even if the sensor has been stuck for hours.
+
 ## Device Signature
 
 ```json
@@ -81,10 +98,11 @@ After pairing with the quirk applied, you'll have two binary sensors:
 
 ## Configuration
 
-To change the motion timeout, edit `bosch_tritech.py`:
+To change the timeouts, edit `bosch_tritech.py`:
 
 ```python
-MOTION_TIMEOUT_S = 120  # Change to desired seconds
+MOTION_TIMEOUT_S = 120           # Occupancy clear timeout (seconds)
+STUCK_MOTION_THRESHOLD_S = 30    # Stuck sensor detection threshold (seconds)
 ```
 
 Then restart Home Assistant.
