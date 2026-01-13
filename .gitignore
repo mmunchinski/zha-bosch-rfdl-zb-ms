@@ -30,3 +30,11 @@ Thumbs.db
 # Backup files
 *.bak
 *.backup
+
+# Local data files (from debugging)
+*.db
+*.db-wal
+*.db-shm
+device_registry.json
+entity_registry.json
+improved_zigbee_monitor.yaml
