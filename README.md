@@ -1,8 +1,5 @@
 # Bosch RFDL-ZB-MS ZHA Quirk
 
-> **Status:** PR [#4593](https://github.com/zigpy/zha-device-handlers/pull/4593) submitted to [zha-device-handlers](https://github.com/zigpy/zha-device-handlers) — awaiting maintainer review.
-> Once merged, this repo will be archived and users should use the official version.
-
 A [ZHA device handler (quirk)](https://github.com/zigpy/zha-device-handlers) for the **Bosch RFDL-ZB-MS RADION TriTech** motion sensor.
 
 ## Background
@@ -176,10 +173,7 @@ Bosch RFDL-ZB-MS [00:0d:6f:00:10:86:cc:91]: Clearing occupancy after 120s timeou
 
 ## Contributing
 
-This quirk is intended for contribution to [zha-device-handlers](https://github.com/zigpy/zha-device-handlers).
-
-- **PR #4593**: https://github.com/zigpy/zha-device-handlers/pull/4593
-- Fork: https://github.com/mmunchinski/zha-device-handlers
+Issues and pull requests welcome. This is a standalone custom quirk maintained independently.
 
 ## License
 
