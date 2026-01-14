@@ -26,14 +26,12 @@ A software-based motion timeout that **guarantees** clear events:
 - 120-second timer starts (reset on each new motion)
 - After 120 seconds of no motion, occupancy turns **off** (guaranteed)
 
-### 2. Smart Stuck Detection
-Handles sensors that get "stuck" in motion state:
-
-| Software State | Clear Event Behavior |
-|----------------|---------------------|
-| Not occupied | Treated as motion (stuck sensor finally resetting) |
-| Occupied 30+ seconds | Treated as motion (stuck sensor resetting) |
-| Occupied < 30 seconds | Ignored (normal quick cycle, timer handles) |
+### 2. Startup State Recovery
+Clears stale occupancy states on Home Assistant restart:
+- 5-second delayed clear after initialization
+- Overrides HA's state restoration from database
+- Only clears if no real motion was detected since startup
+- Prevents sensors from being stuck "detected" after restarts
 
 ### 3. Aggressive Poll Control
 Configures devices to check in more frequently:
@@ -138,7 +136,6 @@ To change the timeouts, edit `bosch_tritech.py`:
 
 ```python
 MOTION_TIMEOUT_S = 120           # Occupancy clear timeout (seconds)
-STUCK_MOTION_THRESHOLD_S = 30    # Stuck sensor detection threshold (seconds)
 STUCK_WARNING_THRESHOLD_S = 1800 # Warn if occupied this long without new events (30 min)
 CHECKIN_INTERVAL = 3600          # Poll control check-in (quarter-seconds, 3600 = 15 min)
 ```
