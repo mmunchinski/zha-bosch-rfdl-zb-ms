@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
 from typing import Any
 
 from zigpy.quirks import CustomCluster, CustomDevice
@@ -54,6 +53,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Motion handling configuration
 MOTION_TIMEOUT_S = 120  # Clear occupancy after this many seconds of no motion
+STUCK_MOTION_THRESHOLD_S = 30  # If occupied longer than this when clear arrives, treat as new motion
 STUCK_WARNING_THRESHOLD_S = 1800  # Warn if occupied for 30+ minutes without new events
 MOTION_CLEAR_EVENT = "motion_clear"
 COMMUNICATION_EVENT = "device_communication"
@@ -157,12 +157,11 @@ class BoschIasZone(CustomCluster, IasZone):
 
             # Parse zone status bits
             alarm1 = bool(zone_status & 0x01)  # Motion
-            alarm2 = bool(zone_status & 0x02)  # Secondary alarm
             tamper = bool(zone_status & 0x04)  # Tamper
             battery_low = bool(zone_status & 0x08)  # Low battery
             supervision = bool(zone_status & 0x20)  # Supervision reports
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Bosch RFDL-ZB-MS [%s]: Zone status 0x%04X - motion=%s, tamper=%s, "
                 "low_battery=%s, supervision=%s (msg #%d)",
                 self.endpoint.device.ieee,
@@ -240,23 +239,34 @@ class BoschOccupancy(LocalDataCluster, OccupancySensing):
         # Schedule a delayed clear to override HA's state restoration
         self._schedule_init_clear()
 
+    def _cancel_timers(self):
+        """Cancel all pending timers for clean teardown."""
+        for handle in (self._timer_handle, self._stuck_check_handle, self._init_clear_handle):
+            if handle is not None:
+                handle.cancel()
+        self._timer_handle = None
+        self._stuck_check_handle = None
+        self._init_clear_handle = None
+
     def _schedule_stuck_check(self):
         """Schedule periodic check for stuck state."""
         try:
-            loop = asyncio.get_event_loop()
-            # Check every 5 minutes
+            loop = asyncio.get_running_loop()
             self._stuck_check_handle = loop.call_later(300, self._check_stuck_state)
-        except Exception:
-            pass  # Event loop may not be available during init
+        except RuntimeError:
+            _LOGGER.debug(
+                "Bosch RFDL-ZB-MS: No running event loop for stuck check scheduling"
+            )
 
     def _schedule_init_clear(self):
         """Schedule a delayed clear to override HA's state restoration."""
         try:
-            loop = asyncio.get_event_loop()
-            # Clear after 5 seconds to override any restored state
+            loop = asyncio.get_running_loop()
             self._init_clear_handle = loop.call_later(5, self._init_clear)
-        except Exception:
-            pass  # Event loop may not be available during init
+        except RuntimeError:
+            _LOGGER.debug(
+                "Bosch RFDL-ZB-MS: No running event loop for init clear scheduling"
+            )
 
     def _init_clear(self):
         """Clear occupancy on startup if no motion detected."""
@@ -278,7 +288,16 @@ class BoschOccupancy(LocalDataCluster, OccupancySensing):
             # Check if occupied for too long without new motion events
             if self._occupied_since is not None:
                 occupied_duration = now - self._occupied_since
-                time_since_last_motion = now - (self._last_motion_event or now)
+                if self._last_motion_event is None:
+                    _LOGGER.warning(
+                        "Bosch RFDL-ZB-MS [%s]: Occupied but no motion event recorded - "
+                        "clearing invalid state",
+                        self.endpoint.device.ieee,
+                    )
+                    self._clear_occupancy()
+                    self._schedule_stuck_check()
+                    return
+                time_since_last_motion = now - self._last_motion_event
 
                 if (occupied_duration > STUCK_WARNING_THRESHOLD_S and
                     time_since_last_motion > STUCK_WARNING_THRESHOLD_S):
@@ -329,13 +348,20 @@ class BoschOccupancy(LocalDataCluster, OccupancySensing):
         # Calculate time since last motion for logging
         was_occupied = self._occupied_since is not None
 
-        _LOGGER.info(
-            "Bosch RFDL-ZB-MS [%s]: Motion #%d detected%s, starting %ds timer",
-            self.endpoint.device.ieee,
-            self._motion_event_count,
-            " (was already occupied)" if was_occupied else "",
-            MOTION_TIMEOUT_S,
-        )
+        if not was_occupied:
+            _LOGGER.info(
+                "Bosch RFDL-ZB-MS [%s]: Motion #%d detected, starting %ds timer",
+                self.endpoint.device.ieee,
+                self._motion_event_count,
+                MOTION_TIMEOUT_S,
+            )
+        else:
+            _LOGGER.debug(
+                "Bosch RFDL-ZB-MS [%s]: Motion #%d detected (already occupied), resetting %ds timer",
+                self.endpoint.device.ieee,
+                self._motion_event_count,
+                MOTION_TIMEOUT_S,
+            )
 
         self._update_attribute(0x0000, 1)  # occupancy = occupied
         self._occupied_since = now
@@ -344,19 +370,23 @@ class BoschOccupancy(LocalDataCluster, OccupancySensing):
             self._timer_handle.cancel()
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self._timer_handle = loop.call_later(MOTION_TIMEOUT_S, self._clear_occupancy)
-        except Exception as e:
-            _LOGGER.error("Failed to schedule clear timer: %s", e)
+        except RuntimeError:
+            _LOGGER.error(
+                "Bosch RFDL-ZB-MS [%s]: No running event loop - cannot schedule clear timer",
+                self.endpoint.device.ieee,
+            )
 
     def motion_clear(self):
         """Handle clear event from hardware.
 
-        Clear events indicate motion has stopped. We let the software timer handle
-        the actual occupancy clearing to provide a consistent timeout period.
+        Treats clear as new motion in two scenarios:
+        1. Not currently occupied - sensor was stuck, this clear indicates new activity
+        2. Occupied longer than STUCK_MOTION_THRESHOLD_S - sensor reset due to new motion
+           but sent clear instead of motion event (known iControl firmware behavior)
 
-        Only treat clear as new motion if not currently occupied (edge case where
-        sensor was stuck and this clear indicates it has recovered).
+        Clears arriving within the threshold are normal operation and ignored.
         """
         self._clear_event_count += 1
         self._last_communication = time.monotonic()
@@ -373,14 +403,24 @@ class BoschOccupancy(LocalDataCluster, OccupancySensing):
 
         occupied_duration = time.monotonic() - self._occupied_since
 
-        _LOGGER.debug(
-            "Bosch RFDL-ZB-MS [%s]: Clear #%d after %ds - "
-            "timer will clear occupancy in %ds",
-            self.endpoint.device.ieee,
-            self._clear_event_count,
-            int(occupied_duration),
-            MOTION_TIMEOUT_S,
-        )
+        if occupied_duration >= STUCK_MOTION_THRESHOLD_S:
+            _LOGGER.info(
+                "Bosch RFDL-ZB-MS [%s]: Clear #%d after %ds (>%ds threshold) - "
+                "treating as new motion (sensor reset)",
+                self.endpoint.device.ieee,
+                self._clear_event_count,
+                int(occupied_duration),
+                STUCK_MOTION_THRESHOLD_S,
+            )
+            self.motion_event()
+        else:
+            _LOGGER.debug(
+                "Bosch RFDL-ZB-MS [%s]: Clear #%d after %ds - "
+                "normal clear, timer will handle",
+                self.endpoint.device.ieee,
+                self._clear_event_count,
+                int(occupied_duration),
+            )
 
     def _clear_occupancy(self):
         """Clear occupancy after timeout."""
