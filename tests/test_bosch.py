@@ -6,6 +6,7 @@ from unittest import mock
 
 import custom_zha_quirks.bosch_tritech
 from custom_zha_quirks.bosch_tritech import (
+    BoschBatteryLow,
     BoschIasZone,
     BoschOccupancy,
     BoschRFDLZBMS,
@@ -17,6 +18,8 @@ from custom_zha_quirks.bosch_tritech import (
 # Format: frame_ctrl(0x09), seq(0x21), cmd(0x00), zone_status(u16le), ext(u8), zone_id(u8), delay(u16le)
 ZCL_IAS_MOTION_COMMAND = b"\x09\x21\x00\x01\x00\x00\x00\x00\x00"  # alarm1=1 (motion)
 ZCL_IAS_CLEAR_COMMAND = b"\x09\x21\x00\x00\x00\x00\x00\x00\x00"  # alarm1=0 (clear)
+ZCL_IAS_SUPERVISION_COMMAND = b"\x09\x21\x00\x20\x00\x00\x00\x00\x00"  # supervision only (0x0020)
+ZCL_IAS_SUPERVISION_LOWBAT_COMMAND = b"\x09\x21\x00\x28\x00\x00\x00\x00\x00"  # supervision + low_battery (0x0028)
 
 
 class ClusterListener:
@@ -220,8 +223,9 @@ async def test_ias_zone_forwards_clear_to_bus(zigpy_device_from_quirk):
     occupancy = device.endpoints[1].occupancy
     listener = ClusterListener(occupancy)
 
-    # Set occupied first
-    occupancy.motion_event()
+    # Send motion through IAS first (sets _last_zone_status with alarm1=1)
+    hdr, args = ias.deserialize(ZCL_IAS_MOTION_COMMAND)
+    ias.handle_message(hdr, args)
     initial_count = len(listener.attribute_updates)
 
     # Simulate stuck sensor — occupied beyond threshold
@@ -233,6 +237,130 @@ async def test_ias_zone_forwards_clear_to_bus(zigpy_device_from_quirk):
 
     assert len(listener.attribute_updates) == initial_count + 1
     assert occupancy._clear_event_count == 1
+
+
+async def test_supervision_report_ignored_when_not_occupied(zigpy_device_from_quirk):
+    """Supervision reports (alarm1=0, no prior motion) must NOT trigger occupancy."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ias = device.endpoints[1].ias_zone
+    occupancy = device.endpoints[1].occupancy
+    listener = ClusterListener(occupancy)
+
+    assert occupancy._occupied_since is None
+
+    # Send supervision report — should be ignored, not treated as motion clear
+    hdr, args = ias.deserialize(ZCL_IAS_SUPERVISION_COMMAND)
+    ias.handle_message(hdr, args)
+
+    assert len(listener.attribute_updates) == 0
+    assert occupancy._occupied_since is None
+    assert occupancy._clear_event_count == 0
+
+
+async def test_supervision_lowbat_ignored_when_not_occupied(zigpy_device_from_quirk):
+    """Supervision + low_battery reports (0x0028) must NOT trigger occupancy."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ias = device.endpoints[1].ias_zone
+    occupancy = device.endpoints[1].occupancy
+    listener = ClusterListener(occupancy)
+
+    assert occupancy._occupied_since is None
+
+    # Send supervision+lowbat report — the exact pattern from the overnight logs
+    hdr, args = ias.deserialize(ZCL_IAS_SUPERVISION_LOWBAT_COMMAND)
+    ias.handle_message(hdr, args)
+
+    assert len(listener.attribute_updates) == 0
+    assert occupancy._occupied_since is None
+    assert occupancy._clear_event_count == 0
+
+
+async def test_repeated_supervision_never_triggers_occupancy(zigpy_device_from_quirk):
+    """Multiple supervision reports in a row never trigger false occupancy."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ias = device.endpoints[1].ias_zone
+    occupancy = device.endpoints[1].occupancy
+    listener = ClusterListener(occupancy)
+
+    # Send multiple supervision reports like the overnight burst pattern
+    for _ in range(6):
+        hdr, args = ias.deserialize(ZCL_IAS_SUPERVISION_LOWBAT_COMMAND)
+        ias.handle_message(hdr, args)
+
+    assert len(listener.attribute_updates) == 0
+    assert occupancy._occupied_since is None
+    assert occupancy._clear_event_count == 0
+
+
+async def test_real_clear_after_motion_still_works(zigpy_device_from_quirk):
+    """Genuine alarm1 1→0 transition still fires clear event through IAS zone."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ias = device.endpoints[1].ias_zone
+    occupancy = device.endpoints[1].occupancy
+    listener = ClusterListener(occupancy)
+
+    # Motion through IAS
+    hdr, args = ias.deserialize(ZCL_IAS_MOTION_COMMAND)
+    ias.handle_message(hdr, args)
+    assert listener.attribute_updates[-1] == (0x0000, 1)
+
+    # Clear through IAS within threshold — normal clear, ignored by occupancy
+    hdr, args = ias.deserialize(ZCL_IAS_CLEAR_COMMAND)
+    ias.handle_message(hdr, args)
+    assert occupancy._clear_event_count == 1
+
+    # Subsequent supervision reports should NOT fire more clears
+    hdr, args = ias.deserialize(ZCL_IAS_SUPERVISION_COMMAND)
+    ias.handle_message(hdr, args)
+    assert occupancy._clear_event_count == 1  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Battery low binary sensor tests
+# ---------------------------------------------------------------------------
+
+
+async def test_battery_low_cluster_exists(zigpy_device_from_quirk):
+    """Replacement endpoint includes BoschBatteryLow cluster."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ep = device.endpoints[1]
+    binary_input = ep.in_clusters[0x000F]  # BinaryInput cluster id
+    assert isinstance(binary_input, BoschBatteryLow)
+
+
+async def test_battery_low_set_by_zone_status(zigpy_device_from_quirk):
+    """IAS Zone low_battery bit sets the binary sensor via bus."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ias = device.endpoints[1].ias_zone
+    battery_cluster = device.endpoints[1].in_clusters[0x000F]
+    listener = ClusterListener(battery_cluster)
+
+    # Initially not low
+    assert battery_cluster._attr_cache.get(0x0055) == 0
+
+    # Send supervision+lowbat (0x0028) — low_battery=True
+    hdr, args = ias.deserialize(ZCL_IAS_SUPERVISION_LOWBAT_COMMAND)
+    ias.handle_message(hdr, args)
+
+    assert battery_cluster._attr_cache.get(0x0055) == 1
+    assert (0x0055, 1) in listener.attribute_updates
+
+
+async def test_battery_low_cleared_by_zone_status(zigpy_device_from_quirk):
+    """Battery low clears when zone status no longer has low_battery bit."""
+    device = zigpy_device_from_quirk(BoschRFDLZBMS)
+    ias = device.endpoints[1].ias_zone
+    battery_cluster = device.endpoints[1].in_clusters[0x000F]
+
+    # Set low first
+    hdr, args = ias.deserialize(ZCL_IAS_SUPERVISION_LOWBAT_COMMAND)
+    ias.handle_message(hdr, args)
+    assert battery_cluster._attr_cache.get(0x0055) == 1
+
+    # Motion event without low_battery clears it
+    hdr, args = ias.deserialize(ZCL_IAS_MOTION_COMMAND)
+    ias.handle_message(hdr, args)
+    assert battery_cluster._attr_cache.get(0x0055) == 0
 
 
 # ---------------------------------------------------------------------------

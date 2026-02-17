@@ -23,6 +23,7 @@ from zigpy.quirks import CustomCluster, CustomDevice
 from zigpy.profiles import zha
 from zigpy.zcl.clusters.general import (
     Basic,
+    BinaryInput,
     Identify,
     Ota,
     PollControl,
@@ -57,6 +58,7 @@ STUCK_MOTION_THRESHOLD_S = 30  # If occupied longer than this when clear arrives
 STUCK_WARNING_THRESHOLD_S = 1800  # Warn if occupied for 30+ minutes without new events
 MOTION_CLEAR_EVENT = "motion_clear"
 COMMUNICATION_EVENT = "device_communication"
+BATTERY_LOW_EVENT = "battery_low_update"
 
 # Poll control configuration (in quarter-seconds)
 CHECKIN_INTERVAL = 3600  # 15 minutes (3600 quarter-seconds) - more aggressive than default
@@ -185,16 +187,58 @@ class BoschIasZone(CustomCluster, IasZone):
                     self.endpoint.device.ieee,
                 )
 
+            # Check previous alarm1 state before updating
+            prev_alarm1 = bool(self._last_zone_status & 0x01) if self._last_zone_status is not None else False
             self._last_zone_status = zone_status
 
             # Notify communication received
             self.endpoint.device.motion_bus.listener_event(COMMUNICATION_EVENT)
 
-            # Forward motion events
+            # Forward battery low state
+            self.endpoint.device.motion_bus.listener_event(BATTERY_LOW_EVENT, battery_low)
+
+            # Forward motion events — only fire clear on alarm1 transition 1→0
+            # to avoid supervision/status reports triggering false occupancy
             if alarm1:
                 self.endpoint.device.motion_bus.listener_event(MOTION_EVENT)
-            else:
+            elif prev_alarm1:
                 self.endpoint.device.motion_bus.listener_event(MOTION_CLEAR_EVENT)
+            else:
+                _LOGGER.debug(
+                    "Bosch RFDL-ZB-MS [%s]: Ignoring non-motion zone status "
+                    "(alarm1 was already clear)",
+                    self.endpoint.device.ieee,
+                )
+
+
+class BoschBatteryLow(LocalDataCluster, BinaryInput):
+    """Binary sensor exposing the IAS Zone low_battery bit.
+
+    The IAS Zone low_battery flag is set by the sensor's own firmware when
+    its internal battery threshold is crossed — more reliable than the
+    voltage-derived percentage from PowerConfiguration.
+    """
+
+    cluster_id = BinaryInput.cluster_id
+
+    def __init__(self, *args, **kwargs):
+        """Initialize with inactive state."""
+        super().__init__(*args, **kwargs)
+        self._update_attribute(0x0051, "battery")  # description
+        self._update_attribute(0x0055, 0)  # present_value = not low
+        self._update_attribute(0x006F, 0x01)  # status_flags = normal
+        self.endpoint.device.motion_bus.add_listener(self)
+
+    def battery_low_update(self, is_low: bool):
+        """Update binary sensor from IAS Zone low_battery bit."""
+        value = 1 if is_low else 0
+        if self._attr_cache.get(0x0055) != value:
+            _LOGGER.info(
+                "Bosch RFDL-ZB-MS [%s]: Battery low state changed to %s",
+                self.endpoint.device.ieee,
+                is_low,
+            )
+        self._update_attribute(0x0055, value)
 
 
 class BoschOccupancy(LocalDataCluster, OccupancySensing):
@@ -493,6 +537,7 @@ class BoschRFDLZBMS(CustomDevice):
                     BoschIasZone,  # Enhanced IAS Zone with tracking
                     Diagnostic.cluster_id,
                     BoschOccupancy,  # Virtual occupancy with health monitoring
+                    BoschBatteryLow,  # IAS Zone low_battery bit as binary sensor
                 ],
                 OUTPUT_CLUSTERS: [
                     Ota.cluster_id,
